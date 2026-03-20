@@ -1,13 +1,13 @@
-name: Auto Rebase on Upstream
+name: Auto Rebase on Upstream Release
 
 on:
   schedule:
-    # Run every Monday at 2 AM UTC
-    - cron: '0 2 * * 1'
+    # Check for new releases every 6 hours
+    - cron: '0 */6 * * *'
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
-  auto-rebase:
+  check-and-rebase:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -22,19 +22,44 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add upstream remote
+      - name: Add upstream remote and fetch
         run: |
           git remote add upstream https://github.com/ynput/ayon-core.git || true
-          git fetch upstream
+          git fetch upstream --tags
 
-      - name: Attempt rebase
+      - name: Check for new upstream release
+        id: check_release
+        run: |
+          # Get latest upstream tag
+          LATEST_UPSTREAM_TAG=$(git tag -l --sort=-version:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          echo "Latest upstream tag: $LATEST_UPSTREAM_TAG"
+
+          # Get the tag our branch is currently based on
+          CURRENT_BASE=$(git describe --tags --abbrev=0 $(git merge-base HEAD upstream/develop) 2>/dev/null || echo "none")
+          echo "Current base tag: $CURRENT_BASE"
+
+          echo "latest_tag=$LATEST_UPSTREAM_TAG" >> $GITHUB_OUTPUT
+          echo "current_base=$CURRENT_BASE" >> $GITHUB_OUTPUT
+
+          if [ "$LATEST_UPSTREAM_TAG" != "$CURRENT_BASE" ]; then
+            echo "needs_rebase=true" >> $GITHUB_OUTPUT
+            echo "🆕 New release detected: $LATEST_UPSTREAM_TAG"
+          else
+            echo "needs_rebase=false" >> $GITHUB_OUTPUT
+            echo "✅ Already up-to-date with latest release: $LATEST_UPSTREAM_TAG"
+          fi
+
+      - name: Attempt rebase on latest release
         id: rebase
+        if: steps.check_release.outputs.needs_rebase == 'true'
         continue-on-error: true
         run: |
-          echo "Starting rebase of rez-bootstrap-modifications onto upstream/develop"
-          if git rebase upstream/develop; then
+          LATEST_TAG="${{ steps.check_release.outputs.latest_tag }}"
+          echo "Starting rebase of rez-bootstrap-modifications onto upstream tag $LATEST_TAG"
+
+          if git rebase $LATEST_TAG; then
             echo "status=success" >> $GITHUB_OUTPUT
-            echo "✅ Rebase successful!"
+            echo "✅ Rebase successful onto $LATEST_TAG!"
           else
             echo "status=conflict" >> $GITHUB_OUTPUT
             echo "❌ Rebase failed - conflicts detected"
@@ -46,27 +71,28 @@ jobs:
         if: steps.rebase.outputs.status == 'success'
         run: |
           git push --force-with-lease origin rez-bootstrap-modifications
-          echo "✅ Successfully pushed rebased branch"
+          echo "✅ Successfully pushed rebased branch to ${{ steps.check_release.outputs.latest_tag }}"
 
       - name: Create issue on conflict
         if: steps.rebase.outputs.status == 'conflict'
         uses: actions/github-script@v7
         with:
           script: |
-            const issueTitle = '🔄 Auto-rebase failed - manual intervention required';
+            const latestTag = '${{ steps.check_release.outputs.latest_tag }}';
+            const issueTitle = `🔄 Auto-rebase failed for release ${latestTag}`;
             const issueBody = `
             ## Auto-rebase Conflict Detected
 
-            The scheduled rebase of \`rez-bootstrap-modifications\` onto \`upstream/develop\` encountered conflicts.
+            The scheduled rebase of \`rez-bootstrap-modifications\` onto upstream release \`${latestTag}\` encountered conflicts.
 
             **Action Required:**
-            1. Pull the latest changes: \`git fetch upstream\`
-            2. Manually rebase: \`git rebase upstream/develop\`
+            1. Pull the latest changes: \`git fetch upstream --tags\`
+            2. Manually rebase: \`git rebase ${latestTag}\`
             3. Resolve conflicts
             4. Force push: \`git push --force-with-lease origin rez-bootstrap-modifications\`
 
             **Branch:** rez-bootstrap-modifications
-            **Upstream:** ynput/ayon-core develop
+            **Upstream Release:** ${latestTag}
             **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             `;
 
@@ -95,3 +121,36 @@ jobs:
                 body: `🔄 Another rebase conflict detected on ${new Date().toISOString()}\n\n${issueBody}`
               });
             }
+
+      - name: Create success notification
+        if: steps.rebase.outputs.status == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const latestTag = '${{ steps.check_release.outputs.latest_tag }}';
+            const currentBase = '${{ steps.check_release.outputs.current_base }}';
+
+            // Close any open rebase conflict issues
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'auto-rebase-conflict'
+            });
+
+            for (const issue of existingIssues.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `✅ Successfully rebased onto ${latestTag}. Closing this issue.`
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed'
+              });
+            }
+
+            core.info(`✅ Successfully rebased from ${currentBase} to ${latestTag}`);
