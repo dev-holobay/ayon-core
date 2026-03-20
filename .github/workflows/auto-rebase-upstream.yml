@@ -1,0 +1,97 @@
+name: Auto Rebase on Upstream
+
+on:
+  schedule:
+    # Run every Monday at 2 AM UTC
+    - cron: '0 2 * * 1'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  auto-rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: rez-bootstrap-modifications
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/ynput/ayon-core.git || true
+          git fetch upstream
+
+      - name: Attempt rebase
+        id: rebase
+        continue-on-error: true
+        run: |
+          echo "Starting rebase of rez-bootstrap-modifications onto upstream/develop"
+          if git rebase upstream/develop; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ Rebase successful!"
+          else
+            echo "status=conflict" >> $GITHUB_OUTPUT
+            echo "❌ Rebase failed - conflicts detected"
+            git rebase --abort
+            exit 1
+          fi
+
+      - name: Push rebased branch
+        if: steps.rebase.outputs.status == 'success'
+        run: |
+          git push --force-with-lease origin rez-bootstrap-modifications
+          echo "✅ Successfully pushed rebased branch"
+
+      - name: Create issue on conflict
+        if: steps.rebase.outputs.status == 'conflict'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueTitle = '🔄 Auto-rebase failed - manual intervention required';
+            const issueBody = `
+            ## Auto-rebase Conflict Detected
+
+            The scheduled rebase of \`rez-bootstrap-modifications\` onto \`upstream/develop\` encountered conflicts.
+
+            **Action Required:**
+            1. Pull the latest changes: \`git fetch upstream\`
+            2. Manually rebase: \`git rebase upstream/develop\`
+            3. Resolve conflicts
+            4. Force push: \`git push --force-with-lease origin rez-bootstrap-modifications\`
+
+            **Branch:** rez-bootstrap-modifications
+            **Upstream:** ynput/ayon-core develop
+            **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            `;
+
+            // Check if issue already exists
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'auto-rebase-conflict'
+            });
+
+            if (existingIssues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issueTitle,
+                body: issueBody,
+                labels: ['auto-rebase-conflict']
+              });
+            } else {
+              // Update existing issue
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssues.data[0].number,
+                body: `🔄 Another rebase conflict detected on ${new Date().toISOString()}\n\n${issueBody}`
+              });
+            }
