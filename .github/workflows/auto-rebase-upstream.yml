@@ -19,7 +19,7 @@ jobs:
         with:
           ref: rez-bootstrap-modifications
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.AYON_CORE_AND_AYON_APPLICATIONS_REZ }}
 
       - name: Configure Git
         run: |
@@ -72,10 +72,17 @@ jobs:
           fi
 
       - name: Push rebased branch
+        id: push
         if: steps.rebase.outputs.status == 'success'
+        continue-on-error: true
         run: |
-          git push --force-with-lease origin rez-bootstrap-modifications
-          echo "✅ Successfully pushed rebased branch to ${{ steps.check_release.outputs.latest_tag }}"
+          if git push --force-with-lease origin rez-bootstrap-modifications; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ Successfully pushed rebased branch to ${{ steps.check_release.outputs.latest_tag }}"
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "❌ Push rejected - the remote branch likely moved (stale --force-with-lease) or the token lacks push access"
+          fi
 
       - name: Create issue on conflict
         if: steps.rebase.outputs.status == 'conflict'
@@ -87,13 +94,34 @@ jobs:
             const issueBody = `
             ## Auto-rebase Conflict Detected
 
-            The scheduled rebase of \`rez-bootstrap-modifications\` onto upstream release \`${latestTag}\` encountered conflicts.
+            The scheduled rebase of \`rez-bootstrap-modifications\` onto upstream release \`${latestTag}\` encountered conflicts and was aborted by CI.
 
-            **Action Required:**
-            1. Pull the latest changes: \`git fetch upstream --tags\`
-            2. Manually rebase: \`git rebase ${latestTag}\`
-            3. Resolve conflicts
-            4. Force push: \`git push --force-with-lease origin rez-bootstrap-modifications\`
+            ### 🛠️ Fix it locally
+
+            > ⚠️ Do **not** use \`git merge\` or \`git pull\` on this branch. CI force-pushes it, so its history is rewritten on every successful rebase. Always \`reset --hard\` to origin instead of merging — merging fuses the old and new histories and makes the next rebase replay hundreds of commits in the wrong order.
+
+            \`\`\`bash
+            # 1. Fetch the latest state (both remotes)
+            git fetch origin
+            git fetch upstream --tags
+
+            # 2. Reset your local branch to match origin exactly (NO merge!)
+            git checkout rez-bootstrap-modifications
+            git reset --hard origin/rez-bootstrap-modifications
+
+            # 3. Rebase your custom commits onto the new release tag
+            git rebase ${latestTag}
+            #    For each conflict: edit files, then
+            #      git add <files> && git rebase --continue
+            #    If it goes sideways, start over cleanly with:
+            #      git rebase --abort
+
+            # 4. Sanity-check: your custom commits should sit on top of the tag
+            git log --oneline ${latestTag}..HEAD
+
+            # 5. Force-push the fixed branch
+            git push --force-with-lease origin rez-bootstrap-modifications
+            \`\`\`
 
             **Branch:** rez-bootstrap-modifications
             **Upstream Release:** ${latestTag}
@@ -126,8 +154,78 @@ jobs:
               });
             }
 
+      - name: Create issue on push failure
+        if: steps.push.outputs.status == 'failed'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const latestTag = '${{ steps.check_release.outputs.latest_tag }}';
+            const issueTitle = `🔒 Auto-rebase push rejected for release ${latestTag}`;
+            const issueBody = `
+            ## Push Rejected
+
+            The rebase onto \`${latestTag}\` **succeeded**, but pushing the result from CI was rejected.
+
+            The most likely causes are:
+            - **Stale \`--force-with-lease\`** — \`origin/rez-bootstrap-modifications\` moved after CI fetched it, so the lease check refused the push. Just re-run the workflow.
+            - **Token access** — the \`AYON_CORE_AND_AYON_APPLICATIONS_REZ\` token expired or lost push/workflow permission on this repo. Check the secret and its fine-grained permissions.
+
+            ### 🛠️ Immediate workaround — push it from your machine
+
+            > ⚠️ Do **not** use \`git merge\` or \`git pull\` on this branch. CI force-pushes it, so always \`reset --hard\` to origin instead of merging.
+
+            \`\`\`bash
+            # 1. Fetch the latest state (both remotes)
+            git fetch origin
+            git fetch upstream --tags
+
+            # 2. Reset your local branch to match origin exactly (NO merge!)
+            git checkout rez-bootstrap-modifications
+            git reset --hard origin/rez-bootstrap-modifications
+
+            # 3. Rebase your custom commits onto the new release tag
+            git rebase ${latestTag}
+            #    Resolve any conflicts: git add <files> && git rebase --continue
+            #    (start over cleanly with: git rebase --abort)
+
+            # 4. Sanity-check: your custom commits should sit on top of the tag
+            git log --oneline ${latestTag}..HEAD
+
+            # 5. Force-push from your machine
+            git push --force-with-lease origin rez-bootstrap-modifications
+            \`\`\`
+
+            **Branch:** rez-bootstrap-modifications
+            **Upstream Release:** ${latestTag}
+            **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            `;
+
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'auto-rebase-conflict'
+            });
+
+            if (existingIssues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issueTitle,
+                body: issueBody,
+                labels: ['auto-rebase-conflict']
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssues.data[0].number,
+                body: `🔒 Push rejected again on ${new Date().toISOString()}\n\n${issueBody}`
+              });
+            }
+
       - name: Create success notification
-        if: steps.rebase.outputs.status == 'success'
+        if: steps.push.outputs.status == 'success'
         uses: actions/github-script@v7
         with:
           script: |
@@ -158,3 +256,9 @@ jobs:
             }
 
             core.info(`✅ Successfully rebased from ${currentBase} to ${latestTag}`);
+
+      - name: Fail job if push was rejected
+        if: steps.push.outputs.status == 'failed'
+        run: |
+          echo "❌ Push was rejected - see the created issue for local recovery steps."
+          exit 1
